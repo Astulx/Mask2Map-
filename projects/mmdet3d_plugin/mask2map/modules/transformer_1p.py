@@ -52,6 +52,7 @@ class Mask2Map_Transformer_1Phase(BaseModule):
         patch_size=[60.0, 30.0],
         bev_h=200,
         bev_w=100,
+        query_init_type="learnable",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -119,6 +120,18 @@ class Mask2Map_Transformer_1Phase(BaseModule):
                 self.mlvl_down_layer.append(nn.Linear(self.feat_down_dim[0], self.feat_down_dim[1]))
         self.mask_noise_scale = mask_noise_scale
         self.feat_down_sample_indice = feat_down_sample_indice
+
+        assert query_init_type in ("learnable", "seg_guided"), (
+            f"query_init_type must be 'learnable' or 'seg_guided', got '{query_init_type}'"
+        )
+        self.query_init_type = query_init_type
+        # Lightweight projection used in seg_guided mode to align sampled
+        # BEV features with the learnable-query embedding space.
+        if self.query_init_type == "seg_guided":
+            self.seg_query_proj = nn.Sequential(
+                nn.Linear(self.embed_dims, self.embed_dims),
+                nn.LayerNorm(self.embed_dims),
+            )
 
     def init_weights(self):
         """Initialize the transformer weights."""
@@ -505,6 +518,72 @@ class Mask2Map_Transformer_1Phase(BaseModule):
 
         return instance_query_feat, padding_mask_3level, attn_mask, mask_dict, known_bid, map_known_indice, dn_pad_size, known_masks
 
+    def _seg_guided_query_init(self, mask_feat, num_vecs, bs, dtype):
+        """Initialize instance queries from segmentation feature spatial priors.
+
+        Selects the top-K spatially active positions in *mask_feat* (ranked by
+        feature L2 norm) and gathers the feature vectors at those positions as
+        initial query content.  A lightweight projection aligns the sampled
+        features with the learnable-query embedding space.  Safe fallbacks
+        prevent NaN/Inf and ensure a fixed query count in all cases:
+
+        * If the spatial map has fewer than *num_vecs* positions, the remaining
+          queries are padded with the corresponding learnable embeddings.
+        * Batch items with degenerate features (all-zero, NaN, or Inf) fall
+          back entirely to their learnable embeddings.
+
+        Args:
+            mask_feat (Tensor): Highest-resolution BEV feature map,
+                shape ``[bs, C, H, W]``.
+            num_vecs (int): Target number of instance queries.
+            bs (int): Batch size.
+            dtype (torch.dtype): Output dtype (matched to network dtype).
+
+        Returns:
+            Tensor: Initialized query content, shape ``[bs, num_vecs, embed_dims]``.
+        """
+        C, H, W = mask_feat.shape[1], mask_feat.shape[2], mask_feat.shape[3]
+        HW = H * W
+
+        # Spatial importance: L2 norm across channels → [bs, HW]
+        with torch.no_grad():
+            score_flat = mask_feat.detach().float().norm(dim=1).view(bs, HW)
+
+        # Detect degenerate batch items (zero / NaN / Inf features)
+        score_sum = score_flat.sum(dim=1)  # [bs]
+        degenerate = (~torch.isfinite(score_sum)) | (score_sum < 1e-6)
+
+        # Learnable embeddings serve as base / fallback
+        learnable = self.instance_query_feat.weight[0:num_vecs].unsqueeze(0).expand(bs, -1, -1)
+
+        if degenerate.all():
+            return learnable.to(dtype=dtype)
+
+        # Top-K spatial positions; K ≤ HW always holds
+        K = min(num_vecs, HW)
+        _, topk_indices = torch.topk(score_flat, K, dim=1, largest=True, sorted=False)
+        # topk_indices: [bs, K]
+
+        # Gather BEV features at selected positions
+        feat_flat = mask_feat.float().view(bs, C, HW).permute(0, 2, 1)  # [bs, HW, C]
+        idx_exp = topk_indices.unsqueeze(-1).expand(-1, -1, C)           # [bs, K, C]
+        sampled = torch.gather(feat_flat, 1, idx_exp)                    # [bs, K, C]
+
+        if K < num_vecs:
+            # Pad remaining positions with learnable embeddings
+            pad = learnable[:, K:num_vecs, :].float()
+            sampled = torch.cat([sampled, pad], dim=1)                   # [bs, num_vecs, C]
+
+        # Project sampled features into the query embedding space
+        sampled = self.seg_query_proj(sampled)                           # [bs, num_vecs, C]
+
+        # Replace degenerate batch items entirely with learnable queries
+        if degenerate.any():
+            deg_mask = degenerate.view(bs, 1, 1).expand(bs, num_vecs, C)
+            sampled = torch.where(deg_mask, learnable.float(), sampled)
+
+        return sampled.to(dtype=dtype)
+
     def _forward_head(self, decoder_out, mask_feature, attn_mask_target_size):
 
         decoder_out = self.segm_decoder.post_norm(decoder_out)
@@ -564,7 +643,11 @@ class Mask2Map_Transformer_1Phase(BaseModule):
             decoder_inputs.append(decoder_input)
             decoder_pos_encodings.append(decoder_pos_encoding)
 
-        instance_query_feat = self.instance_query_feat.weight[0:num_vecs].unsqueeze(0).expand(bs, -1, -1)
+        instance_query_feat = (
+            self._seg_guided_query_init(mask_feat, num_vecs, bs, bev_embed_ms[0].dtype)
+            if self.query_init_type == "seg_guided"
+            else self.instance_query_feat.weight[0:num_vecs].unsqueeze(0).expand(bs, -1, -1)
+        )
         instance_query_pos = None
 
         if self.dn_enabled and self.training:
