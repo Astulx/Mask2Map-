@@ -42,7 +42,19 @@ However, we observed limited performance in Mask2Map due to inter-network incons
 | Mask2Map| R50 |bevpool | 110ep | 75.4 | [config](https://github.com/SehwanChoi0307/Mask2Map/tree/main/projects/configs/mask2map/M2M_nusc_r50_full_2Phase_55n55ep.py) | [model_phase1](https://drive.google.com/file/d/1nuFMOmH8UqHW3FlreX19Uf8Il2ldKV-E/view?usp=sharing) | [model_phase2](https://drive.google.com/file/d/1eX17lKbqkLqOkk18u7vPIQhDvuT5j81O/view?usp=sharing) |
 
 **Notes**: 
-- All the experiments are performed on 4 NVIDIA GeForce RTX 3090 GPUs. 
+- All the experiments are performed on 4 NVIDIA GeForce RTX 3090 GPUs.
+
+## Single-stage joint training (new)
+
+A single-stage config is now available for users who want to skip the two-phase
+workflow and train segmentation + vectorization jointly in one run:
+
+```bash
+./tools/dist_train.sh \
+    projects/configs/mask2map/M2M_nusc_r50_full_joint_24ep.py 8
+```
+
+See [Train and Eval](docs/train_eval.md) for full details and caveats.
 
 ## Getting Started
 - [Installation](docs/install.md)
