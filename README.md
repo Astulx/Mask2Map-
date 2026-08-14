@@ -62,6 +62,54 @@ See [Train and Eval](docs/train_eval.md) for full details and caveats.
 - [Train and Eval](docs/train_eval.md)
 
 
+## Query Initialization Modes
+
+The 1-Phase transformer (`Mask2Map_Transformer_1Phase`) supports two modes for
+initializing the decoder instance queries, controlled by the `query_init_type`
+parameter in the transformer config dict.
+
+| Value | Behaviour |
+|---|---|
+| `"learnable"` *(default)* | Queries are initialized from a fixed, learnable `nn.Embedding` table — the original Mask2Map behaviour. Existing checkpoints are fully compatible. |
+| `"seg_guided"` | Queries are initialized from the highest-resolution BEV feature map produced by the pixel decoder.  The top-*K* spatially active positions (ranked by feature L2 norm) are selected and the corresponding feature vectors are gathered as initial query content.  A lightweight `Linear + LayerNorm` projection aligns the sampled features with the learnable-query embedding space.  Safe fallbacks prevent NaN / Inf and pad with learnable queries whenever fewer than *K* valid positions exist or batch items carry degenerate features. |
+
+### How to enable seg-guided mode
+
+Add `query_init_type="seg_guided"` to the `transformer` sub-dict in your
+config file:
+
+```python
+transformer=dict(
+    type="Mask2Map_Transformer_1Phase",
+    ...
+    query_init_type="seg_guided",   # <-- new option
+    ...
+)
+```
+
+A ready-to-use example config is provided at:
+```
+projects/configs/mask2map/M2M_nusc_r50_full_1Phase_12n12ep_seg_guided.py
+```
+
+Train with:
+```bash
+./tools/dist_train.sh \
+    projects/configs/mask2map/M2M_nusc_r50_full_1Phase_12n12ep_seg_guided.py \
+    <num_gpus>
+```
+
+### Caveats
+
+* `query_init_type="seg_guided"` introduces a small additional `seg_query_proj`
+  (`Linear + LayerNorm`) parameter group.  Existing `"learnable"` checkpoints
+  cannot be loaded directly into a `"seg_guided"` model (and vice-versa).
+* The seg-guided init is deterministic given the BEV features; no randomness is
+  added at inference time.
+* The `"learnable"` default is unchanged — all existing configs and
+  checkpoints continue to work without modification.
+
+
 ## Demo
 
 ![demo](assets/demo.gif "demo")
